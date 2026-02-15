@@ -13,7 +13,7 @@ ZOOM_OFFSET=0      # start time for the zoom (seconds)
 # -----------------------------
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [OPTIONS] [DIRECTORY]
+Usage: $(basename "$0") [OPTIONS] [AUDIO_DIR] [OUTPUT_DIR]
 
 Generate spectrograms and calculate crest factor (peak-to-RMS ratio) for audio files.
 
@@ -24,7 +24,8 @@ Options:
     -o OFFSET      Set zoom window start offset (default: $ZOOM_OFFSET)
 
 Arguments:
-    DIRECTORY      Directory containing audio files (default: current directory)
+    AUDIO_DIR      Directory containing audio files (default: current directory)
+    OUTPUT_DIR     Directory for output PNGs and CSVs (default: current directory)
 
 Outputs:
     - PNG spectrograms (stacked full + zoom views)
@@ -34,6 +35,7 @@ EOF
 }
 
 # Parse arguments
+positional=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help) usage ;;
@@ -41,22 +43,24 @@ while [[ $# -gt 0 ]]; do
         -z) ZOOM_SECS="$2"; shift 2 ;;
         -o) ZOOM_OFFSET="$2"; shift 2 ;;
         -*) echo "Unknown option: $1" >&2; exit 1 ;;
-        *)  WORK_DIR="$1"; shift ;;
+        *)  positional+=("$1"); shift ;;
     esac
 done
 
-WORK_DIR="${WORK_DIR:-.}"
-[[ -d "$WORK_DIR" ]] || { echo "Error: '$WORK_DIR' is not a directory" >&2; exit 1; }
-cd "$WORK_DIR" || exit 1
+AUDIO_DIR="$(realpath "${positional[0]:-.}")"
+OUTPUT_DIR="${positional[1]:-.}"
+[[ -d "$AUDIO_DIR" ]] || { echo "Error: not a directory: $AUDIO_DIR" >&2; exit 1; }
+mkdir -p "$OUTPUT_DIR" || { echo "Error: cannot create output directory: $OUTPUT_DIR" >&2; exit 1; }
+cd "$OUTPUT_DIR" || { echo "Error: cannot cd to $OUTPUT_DIR" >&2; exit 1; }
 
 # -----------------------------
 # Package manager detection
 # Checks for common package managers in order of prevalence.
-# Returns the first available manager name, or empty string if none found.
+# Returns the first available manager name.
 # -----------------------------
 detect_pkg_mgr() {
     local managers=(
-        apt-get apt     # Debian/Ubuntu
+        apt-get apt     # Debian/Ubuntu (apt-get preferred for non-interactive use)
         dnf yum         # Fedora/RHEL/CentOS
         pacman          # Arch Linux
         zypper          # openSUSE
@@ -86,15 +90,11 @@ install_dependency() {
     local mgr
     mgr=$(detect_pkg_mgr) || { echo "Error: No supported package manager found." >&2; exit 1; }
 
-    # Map generic tool name to distro-specific package name
+    # Override only where the package name differs from the tool name
     local pkg="$want"
     case "$mgr" in
-        apt-get|apt)    [[ "$want" == "imagemagick" ]] && pkg="imagemagick" ;;
-        dnf|yum)        [[ "$want" == "imagemagick" ]] && pkg="ImageMagick" ;;
-        pacman)         [[ "$want" == "imagemagick" ]] && pkg="imagemagick" ;;
-        zypper)         [[ "$want" == "imagemagick" ]] && pkg="ImageMagick" ;;
-        apk)            [[ "$want" == "imagemagick" ]] && pkg="imagemagick" ;;
-        xbps-install)   [[ "$want" == "imagemagick" ]] && pkg="ImageMagick" ;;
+        dnf|yum|zypper|xbps-install)
+            if [[ "$want" == "imagemagick" ]]; then pkg="ImageMagick"; fi ;;
         emerge)
             case "$want" in
                 sox)         pkg="media-sound/sox" ;;
@@ -107,13 +107,8 @@ install_dependency() {
                 imagemagick) pkg="nixpkgs.imagemagick" ;;
                 bc)          pkg="nixpkgs.bc" ;;
             esac ;;
-        brew)           [[ "$want" == "imagemagick" ]] && pkg="imagemagick" ;;
         pkg)
-            case "$want" in
-                sox)         pkg="sox" ;;
-                imagemagick) pkg="ImageMagick7" ;;
-                bc)          pkg="bc" ;;
-            esac ;;
+            if [[ "$want" == "imagemagick" ]]; then pkg="ImageMagick7"; fi ;;
     esac
 
     echo "Installing $want via $mgr (package: $pkg)..."
@@ -122,7 +117,7 @@ install_dependency() {
         apt)          sudo apt update -y && sudo apt install -y "$pkg" ;;
         dnf)          sudo dnf install -y "$pkg" ;;
         yum)          sudo yum install -y "$pkg" ;;
-        pacman)       sudo pacman -Syu --noconfirm --needed "$pkg" ;;
+        pacman)       sudo pacman -S --noconfirm --needed "$pkg" ;;
         zypper)       sudo zypper --non-interactive in "$pkg" ;;
         apk)          sudo apk add --no-cache "$pkg" ;;
         xbps-install) sudo xbps-install -y "$pkg" ;;
@@ -183,7 +178,7 @@ calculate_crest_factor() {
     if ! stats=$(sox "$file" -n stats -b "$bit_depth" 2>&1); then
         echo "  Error: sox stats failed for $file" >&2
         echo "  Debug output:" >&2
-        echo "$stats" | sed 's/^/    /' >&2
+        printf '    %s\n' "$stats" >&2
         return 1
     fi
 
@@ -202,7 +197,7 @@ calculate_crest_factor() {
         echo "  Error: could not parse audio stats" >&2
         echo "  Peak='$peak' RMS='$rms'" >&2
         echo "  Raw stats:" >&2
-        echo "$stats" | sed 's/^/    /' >&2
+        printf '    %s\n' "$stats" >&2
         return 1
     fi
 }
@@ -218,77 +213,71 @@ calculate_crest_factor() {
 #   4. Stacks both images vertically into final output
 #   5. Calculates and logs crest factor metrics
 # -----------------------------
-process_audio() {
-    local format="$1"
-    echo -e "\nProcessing $format files..."
+process_audio() (
+    local format="$1" srcdir="$2"
+    echo -e "\nProcessing ${format} files..."
 
     shopt -s nullglob
-    local matched=(*."$format")
-    shopt -u nullglob
-
+    local matched=("${srcdir}"/*."${format}")
     if (( ${#matched[@]} == 0 )); then
-        echo "  No .$format files found — skipping."
+        echo "  No .${format} files found -- skipping."
         return 0
     fi
 
     for file in "${matched[@]}"; do
         [[ -f "$file" ]] || continue
 
-        local filename basename title full_png zoomed_png final_png
+        local filename basename err rc
         filename=$(basename -- "$file")
         basename="${filename%.*}"
-        # Escape quotes in filename for sox title display
-        title="${filename//\"/\\\"}"
-        title="${title//\'/\'\\\'\'}"
 
-        full_png="${basename}_full.png"
-        zoomed_png="${basename}_zoomed.png"
-        final_png="${basename}.png"
+        echo "Analyzing: $filename  (width: ${TARGET_PX}px; @48k -> 0-24 kHz)"
 
-        echo "Analyzing: $filename  (width: ${TARGET_PX}px; @48k → 0–24 kHz)"
-
-        # Generate full-length spectrogram
-        # rate -v 48000: resample with very-high-quality algorithm
-        # -x: set output image width in pixels
-        local err exit_code
-        err=$(sox "$file" -n rate -v 48000 spectrogram -x "$TARGET_PX" -t "$title" -o "$full_png" 2>&1) || exit_code=$?
-        if [[ ${exit_code:-0} -ne 0 ]]; then
+        # Full-length spectrogram (resample to 48k; set exact width with -x)
+        err=$(sox "$file" -n rate -v 48000 spectrogram -x "$TARGET_PX" -t "$filename" -o "${basename}_full.png" 2>&1) || rc=$?
+        if [[ ${rc:-0} -ne 0 ]]; then
             echo "  ERROR: spectrogram failed for full image" >&2
             [[ -n "$err" ]] && echo "$err" > "${basename}_full.err"
-            rm -f "$full_png"
-            continue
+            rc=0; continue
         fi
 
-        # Generate zoomed spectrogram for detailed frequency analysis
-        # trim: extract specific time window (offset + duration)
-        err=$(sox "$file" -n rate -v 48000 trim "$ZOOM_OFFSET" "$ZOOM_SECS" spectrogram -x "$TARGET_PX" -t "${title} (zoom)" -o "$zoomed_png" 2>&1) || exit_code=$?
-        if [[ ${exit_code:-0} -ne 0 ]]; then
-            echo "  ERROR: spectrogram failed for zoom image" >&2
-            [[ -n "$err" ]] && echo "$err" > "${basename}_zoomed.err"
-            rm -f "$full_png" "$zoomed_png"
-            continue
+        # Zoom spectrogram (same exact width; different time window)
+        local duration
+        duration=$(soxi -D "$file" 2>/dev/null || echo 0)
+        if (( $(echo "$duration < $ZOOM_OFFSET + $ZOOM_SECS" | bc -l) )); then
+            echo "  Skipping zoom: file shorter than offset+duration"
+        else
+            err=$(sox "$file" -n rate -v 48000 trim "$ZOOM_OFFSET" "$ZOOM_SECS" spectrogram -x "$TARGET_PX" -t "$filename (zoom)" -o "${basename}_zoomed.png" 2>&1) || rc=$?
+            if [[ ${rc:-0} -ne 0 ]]; then
+                echo "  ERROR: spectrogram failed for zoom image" >&2
+                [[ -n "$err" ]] && echo "$err" > "${basename}_zoomed.err"
+                rc=0; continue
+            fi
         fi
 
-        # Stack full and zoomed spectrograms vertically
-        if [[ -f "$full_png" && -f "$zoomed_png" ]]; then
-            magick "$full_png" "$zoomed_png" -append "$final_png"
-            rm -f "$full_png" "$zoomed_png"
+        if [[ -f "${basename}_full.png" && -f "${basename}_zoomed.png" ]]; then
+            if magick "${basename}_full.png" "${basename}_zoomed.png" -append "${basename}.png"; then
+                rm -f "${basename}"_{full,zoomed}.png
+            else
+                echo "  Warning: magick failed; intermediate PNGs retained" >&2
+            fi
+        elif [[ -f "${basename}_full.png" ]]; then
+            mv "${basename}_full.png" "${basename}.png"
         else
             echo "  Warning: spectrogram(s) missing for $filename" >&2
         fi
 
-        # Calculate and log audio metrics
-        calculate_crest_factor "$file" "$format" || true
+        calculate_crest_factor "$file" "${format}" || true
     done
-}
+)
 
 # -----------------------------
 # Main entry point
 # -----------------------------
-process_audio "flac"
-process_audio "wav"
+process_audio "flac" "$AUDIO_DIR"
+process_audio "wav" "$AUDIO_DIR"
 
 echo -e "\nAnalysis complete!"
-[[ -f crest_factor_flac.csv ]] && echo "• FLAC metrics: crest_factor_flac.csv"
-[[ -f crest_factor_wav.csv  ]] && echo "• WAV metrics: crest_factor_wav.csv"
-echo "• Spectrograms saved as PNG files (stacked full + zoom views)"
+[[ -f crest_factor_flac.csv ]] && echo "  FLAC metrics: $OUTPUT_DIR/crest_factor_flac.csv"
+[[ -f crest_factor_wav.csv  ]] && echo "  WAV metrics:  $OUTPUT_DIR/crest_factor_wav.csv"
+echo -e "\nSpectrograms saved to $OUTPUT_DIR"
